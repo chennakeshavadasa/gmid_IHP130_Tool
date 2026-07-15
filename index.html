@@ -782,47 +782,67 @@ function buildDfAll(selectedDevs, selectedLens){
 }
 
 function solveOptimization(df, tA, tB, w1, w2, bB){
-  // σ-normalisation (from LUT subset, exactly as in notebook)
-  const gmidArr=df.map(r=>r.gm_id);
+  // σ-normalisation from the LUT subset (exact notebook method)
+  const gmidArr =df.map(r=>r.gm_id);
   const gmgdsArr=df.map(r=>r.gm_gds);
-  const gmid_std=stdDev(gmidArr);
-  const gmgds_std=stdDev(gmgdsArr);
+  const gmid_std =stdDev(gmidArr)  || 1.0;
+  const gmgds_std=stdDev(gmgdsArr) || 1.0;
 
-  // Step 1: continuous optimum (closed-form for quadratic with box constraint)
-  //   min w1*((a-tA)/σA)² + w2*((b-tB)/σB)²  s.t. b >= max(bB,tB)
-  //   → optA=tA, optB=max(bB,tB)
-  const gm_gds_floor=Math.max(bB,tB);
-  const optA=tA;
-  const optB=gm_gds_floor;
+  // Continuous optimum (closed-form quadratic with box constraint)
+  const gm_gds_floor       = Math.max(bB, tB);
+  const optA               = tA;
+  const optB               = gm_gds_floor;
+  const max_achievable_gmgds = Math.max(...gmgdsArr);
 
-  // ── CRITICAL FIX: clamp optB for LUT search to max achievable gm/gds ──
-  // If target gm/gds exceeds what the LUT can provide, the gm/gds distance
-  // term dominates by 100x and the search picks wrong gm/id entirely.
-  // Clamp so the search finds the best gm/id near the highest achievable gm/gds.
-  const max_achievable_gmgds = Math.max(...df.map(r=>r.gm_gds));
+  // Clamp optB_search to what the data can actually deliver.
+  // When optB exceeds max_achievable, the raw gm/gds distance term swamps
+  // the gm/id term (100x larger) and the search returns wrong gm/id entirely.
   const optB_search = Math.min(max_achievable_gmgds, optB);
 
-  // Step 2: nearest-neighbour search in LUT using same normalised distance
-  // Use optB_search (clamped) so impossible gm/gds targets don't swamp gm/id accuracy
-  const sorted=[...df].map(r=>({
-    ...r,
-    distance: w1*((r.gm_id-optA)/gmid_std)**2 + w2*((r.gm_gds-optB_search)/gmgds_std)**2
-  })).sort((a,b)=>a.distance-b.distance);
-  const top5=sorted.slice(0,5);
+  // ── TWO-PHASE LUT SEARCH ─────────────────────────────────────────────────
+  // The gm/id and gm/gds at any operating point are physically correlated.
+  // If we blindly minimise the joint loss, an impossible gm/gds target can
+  // still pull gm/id far from the user's target (e.g. tA=10, tB=2 in LV_NMOS
+  // gives gm/id=1.3 because gm/gds≈2 only exists at deep saturation).
+  //
+  // Phase 1 — gm/id PRIMARY:
+  //   Restrict to rows where gm/id is within ±GMID_TOL of the target.
+  //   Tolerance = max(2.5, 30% of σ_A) ≈ 3 V⁻¹ for most devices.
+  //   Among those rows, rank by the full joint σ-normalised distance.
+  //
+  // Phase 2 — Fallback:
+  //   If fewer than 5 rows survive Phase 1 (extreme target outside data range),
+  //   fall back to unconstrained full-LUT search.
+  //
+  // For normal cases (achievable targets), Phase 1 is a no-op: the optimal
+  // point already lies inside the gm/id tolerance, so ranking is unchanged.
 
-  // Step 3: convergence trace (6 gradient steps from mean, as in notebook)
-  let aLog=mean(gmidArr);
-  let bLog=Math.max(bB, mean(gmgdsArr));
+  const GMID_TOL = Math.max(2.5, gmid_std * 0.30); // typically ~3 V⁻¹
+
+  const distFn = r =>
+    w1*((r.gm_id-optA)/gmid_std)**2 + w2*((r.gm_gds-optB_search)/gmgds_std)**2;
+
+  const phase1 = df.filter(r => Math.abs(r.gm_id - optA) <= GMID_TOL);
+  const searchSet = (phase1.length >= 5) ? phase1 : df;  // fallback if target OOB
+
+  const sorted = [...searchSet]
+    .map(r=>({...r, distance: distFn(r)}))
+    .sort((a,b)=>a.distance-b.distance);
+  const top5 = sorted.slice(0, 5);
+
+  // Convergence trace — 6 iterative steps from LUT mean (matches notebook display)
+  let aLog=mean(gmidArr), bLog=Math.max(bB, mean(gmgdsArr));
   const logs=[];
   for(let i=0;i<6;i++){
-    aLog+=(optA-aLog)*0.55;
-    bLog+=(optB-bLog)*0.55;
+    aLog+=(optA-aLog)*0.55; bLog+=(optB-bLog)*0.55;
     const lv=w1*((aLog-tA)/gmid_std)**2+w2*((bLog-tB)/gmgds_std)**2;
     logs.push(`i${i+1}: ${lv.toExponential(2)}`);
   }
 
-  return {optA,optB,optB_search,top5,bestRow:top5[0],logs,gmid_std,gmgds_std,
-          max_achievable_gmgds,df_gmid_mean:mean(gmidArr),df_gmgds_mean:mean(gmgdsArr)};
+  return {optA, optB, optB_search, top5, bestRow:top5[0], logs,
+          gmid_std, gmgds_std, max_achievable_gmgds, gmid_tol:GMID_TOL,
+          phase1_used: phase1.length >= 5,
+          df_gmid_mean:mean(gmidArr), df_gmgds_mean:mean(gmgdsArr)};
 }
 
 // Plasma colormap (matches matplotlib 'plasma')
@@ -933,7 +953,7 @@ function renderHelperPlots(df,res,tA,tB,bB,w1,w2){
 }
 
 function renderHelperOutput(res,tA,tB,bB,warnHtml){
-  const {top5,bestRow,logs,optA,optB,optB_search}=res;
+  const {top5,bestRow,logs,optA,optB,optB_search,gmid_tol,phase1_used}=res;
   if(!bestRow){ document.getElementById('helperOutput').innerHTML=warnHtml+'<div class="helper-empty"><div class="icon">⚠️</div><div>No valid operating point found. Relax constraints.</div></div>'; return; }
 
   // Distance range for colour coding
@@ -949,9 +969,9 @@ function renderHelperOutput(res,tA,tB,bB,warnHtml){
   </div>
   <div style="background:linear-gradient(90deg,rgba(63,185,80,.06),transparent);border:1px solid rgba(63,185,80,.25);border-left:3px solid #3fb950;border-radius:7px;padding:12px 16px;margin-bottom:12px;font-size:12px;color:var(--t2)">
     <div style="display:flex;gap:24px;flex-wrap:wrap">
-      <div>Target gm/ID: <strong style="color:var(--t1)">${tA.toFixed(2)}</strong> → Searched: <strong style="color:#3fb950">${optA.toFixed(2)}</strong></div>
+      <div>Target gm/ID: <strong style="color:var(--t1)">${tA.toFixed(2)}</strong> → Searched: <strong style="color:#3fb950">${optA.toFixed(2)}</strong> <span style="color:var(--t3);font-size:10px">(tol ±${gmid_tol.toFixed(1)} V⁻¹)</span></div>
       <div>Target gm/gds: <strong style="color:var(--t1)">${tB.toFixed(0)}</strong> → Searched: <strong style="color:#3fb950">${optB_search.toFixed(1)}</strong>${optB_search<optB?` <span style="color:var(--gold);font-size:10px">(clamped from ${optB.toFixed(0)})</span>`:''}</div>
-      <div>Bound (min gm/gds): <strong style="color:var(--t1)">${bB}</strong></div>
+      <div>Bound (min gm/gds): <strong style="color:var(--t1)">${bB}</strong> &nbsp;·&nbsp; <span style="color:var(--t3);font-size:10px">Search: ${phase1_used?'Phase-1 (gm/ID-primary)':'Full-LUT fallback'}</span></div>
     </div>
   </div>
   <div class="metric-grid">
