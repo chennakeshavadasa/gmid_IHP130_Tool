@@ -317,15 +317,16 @@ body{background:var(--bg);color:var(--t1);font-family:var(--font);font-size:14px
         <span class="h-sub">Hard lower bound — optimizer never goes below this</span>
         <input type="range" class="h-range" id="s-bB" min="2" max="400" step="1" value="55" oninput="document.getElementById('v-bB').textContent=this.value">
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:9px">
-        <div class="h-field">
-          <span class="h-lbl">Weight w₁ (gm/ID)</span>
-          <input type="number" class="h-inp" id="h-w1" value="10" min="0.1" max="50" step="0.5">
+      <div style="background:var(--card);border:1px solid var(--b2);border-radius:6px;padding:9px 12px;font-size:11px;color:var(--t3)">
+        <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+          <span>w₁ — gm/ID importance</span>
+          <span style="color:var(--acc);font-weight:700">10</span>
         </div>
-        <div class="h-field">
-          <span class="h-lbl">Weight w₂ (gm/gds)</span>
-          <input type="number" class="h-inp" id="h-w2" value="20" min="0.1" max="200" step="1">
+        <div style="display:flex;justify-content:space-between">
+          <span>w₂ — gm/gds importance</span>
+          <span style="color:var(--acc);font-weight:700">20</span>
         </div>
+        <div style="margin-top:6px;font-size:10px;color:var(--t3);border-top:1px solid var(--b1);padding-top:5px">Fixed weights — calibrated for gm/ID design methodology</div>
       </div>
       <button class="run-btn" onclick="runHelper()">▶ Run Optimiser</button>
     </div>
@@ -588,6 +589,7 @@ let curDev='LV_NMOS', curPlot='gmid_vgs', allLengths=[], activeLengths=new Set()
 
 function getColor(i){ return COLORS[i%COLORS.length]; }
 
+
 // ── PAGE NAV ──
 function switchPage(name,el){
   document.querySelectorAll('.navbtn').forEach(b=>b.classList.remove('active'));
@@ -645,9 +647,35 @@ document.getElementById('plotTabs').addEventListener('click',e=>{
 });
 
 // ── TRACES ──
+// ── UNIT-AWARE HOVER FORMATTERS ──
+// Each formatter returns a display string with appropriate scaled units.
+// Voltages: µV < 1mV < mV < 1V < V   |   gm/ID: V⁻¹   |   ID/W: scales to nA   |   fT: MHz/GHz
+const FMT = {
+  vgs:     v => { const a=Math.abs(v); if(a===0) return '0 V';
+                  if(a<1e-3) return `${(v*1e6).toFixed(1)} µV`;
+                  if(a<1)    return `${(v*1e3).toFixed(2)} mV`;
+                             return `${v.toFixed(4)} V`; },
+  vov:     v => { const a=Math.abs(v); if(a===0) return '0 V';
+                  if(a<1e-3) return `${(v*1e6).toFixed(1)} µV`;
+                  if(a<1)    return `${(v*1e3).toFixed(2)} mV`;
+                             return `${v.toFixed(4)} V`; },
+  gm_id:   v => `${v.toFixed(3)} V⁻¹`,
+  gm_gds:  v => v.toFixed(2),
+  id_w:    v => { if(v<1e-3) return `${(v*1e3).toFixed(3)} nA/µm`;
+                  if(v<1)    return `${v.toFixed(4)} µA/µm`;
+                             return `${v.toFixed(3)} µA/µm`; },
+  ft:      v => { if(v<1e-3) return `${(v*1e6).toFixed(1)} kHz`;
+                  if(v<1)    return `${(v*1e3).toFixed(2)} MHz`;
+                             return `${v.toFixed(3)} GHz`; },
+  cgd_cgg: v => v.toFixed(5),
+  cgs_cgg: v => v.toFixed(5),
+};
+
 function buildTraces(plotKey){
   const d=DATA[curDev]; const cfg=PLOT_CONFIGS[plotKey];
   if(!cfg||!d) return [];
+  const xFmt=FMT[cfg.x]||(v=>v.toPrecision(4));
+  const yFmt=FMT[cfg.y]||(v=>v.toPrecision(4));
   return d.labels.reduce((acc,L,i)=>{
     if(!activeLengths.has(L)) return acc;
     const xArr=d[cfg.x][i], yArr=d[cfg.y][i];
@@ -655,9 +683,10 @@ function buildTraces(plotKey){
     const pts=xArr.map((x,j)=>[x,yArr[j]]).filter(([x,y])=>isFinite(x)&&isFinite(y)&&y>0);
     if(!pts.length) return acc;
     acc.push({ x:pts.map(p=>p[0]), y:pts.map(p=>p[1]),
+      customdata:pts.map(p=>[xFmt(p[0]),yFmt(p[1])]),
       type:'scatter', mode:'lines', name:`L=${L}`,
       line:{color:getColor(i),width:2},
-      hovertemplate:`<b>L=${L}</b><br>${cfg.xl}: %{x:.4f}<br>${cfg.yl}: %{y:.4g}<extra></extra>` });
+      hovertemplate:`<b>L=${L}</b><br>${cfg.xl}: %{customdata[0]}<br>${cfg.yl}: %{customdata[1]}<extra></extra>` });
     return acc;
   },[]);
 }
@@ -766,10 +795,18 @@ function solveOptimization(df, tA, tB, w1, w2, bB){
   const optA=tA;
   const optB=gm_gds_floor;
 
+  // ── CRITICAL FIX: clamp optB for LUT search to max achievable gm/gds ──
+  // If target gm/gds exceeds what the LUT can provide, the gm/gds distance
+  // term dominates by 100x and the search picks wrong gm/id entirely.
+  // Clamp so the search finds the best gm/id near the highest achievable gm/gds.
+  const max_achievable_gmgds = Math.max(...df.map(r=>r.gm_gds));
+  const optB_search = Math.min(max_achievable_gmgds, optB);
+
   // Step 2: nearest-neighbour search in LUT using same normalised distance
+  // Use optB_search (clamped) so impossible gm/gds targets don't swamp gm/id accuracy
   const sorted=[...df].map(r=>({
     ...r,
-    distance: w1*((r.gm_id-optA)/gmid_std)**2 + w2*((r.gm_gds-optB)/gmgds_std)**2
+    distance: w1*((r.gm_id-optA)/gmid_std)**2 + w2*((r.gm_gds-optB_search)/gmgds_std)**2
   })).sort((a,b)=>a.distance-b.distance);
   const top5=sorted.slice(0,5);
 
@@ -784,8 +821,8 @@ function solveOptimization(df, tA, tB, w1, w2, bB){
     logs.push(`i${i+1}: ${lv.toExponential(2)}`);
   }
 
-  return {optA,optB,top5,bestRow:top5[0],logs,gmid_std,gmgds_std,
-          df_gmid_mean:mean(gmidArr),df_gmgds_mean:mean(gmgdsArr)};
+  return {optA,optB,optB_search,top5,bestRow:top5[0],logs,gmid_std,gmgds_std,
+          max_achievable_gmgds,df_gmid_mean:mean(gmidArr),df_gmgds_mean:mean(gmgdsArr)};
 }
 
 // Plasma colormap (matches matplotlib 'plasma')
@@ -809,25 +846,26 @@ function runHelper(){
   const tA=parseFloat(document.getElementById('s-tA').value)||15;
   const tB=parseFloat(document.getElementById('s-tB').value)||50;
   const bB=parseFloat(document.getElementById('s-bB').value)||55;
-  const w1=parseFloat(document.getElementById('h-w1').value)||10;
-  const w2=parseFloat(document.getElementById('h-w2').value)||20;
+  const w1=10, w2=20;  // Fixed weights — calibrated, not user-adjustable
 
   const df=buildDfAll(selDevs,selLens);
   if(!df.length){ document.getElementById('helperOutput').innerHTML='<div class="helper-empty"><div class="icon">⚠️</div><div>No data for selected devices.</div></div>'; return; }
 
-  // Warn if target gm/gds exceeds max achievable
-  const maxGmgds=Math.max(...df.map(r=>r.gm_gds));
-  let warnHtml='';
-  if(tB>maxGmgds) warnHtml=`<div class="warn-box">⚠ Target gm/gds = ${tB} exceeds max achievable (${maxGmgds.toFixed(1)}) in selected data. Showing best achievable point.</div>`;
+  // Warning is generated after solve using res.max_achievable_gmgds
 
   const res=solveOptimization(df,tA,tB,w1,w2,bB);
 
+  let warnHtml='';
+  if(tB > res.max_achievable_gmgds)
+    warnHtml=`<div class="warn-box">⚠ Target gm/gds = ${tB} exceeds the maximum achievable in the selected LUT (${res.max_achievable_gmgds.toFixed(1)}). Search clamped to ${res.optB_search.toFixed(1)} — results show best gm/ID match at highest available gm/gds.</div>`;
+  else if(bB > res.max_achievable_gmgds)
+    warnHtml=`<div class="warn-box">⚠ Bound (min gm/gds = ${bB}) exceeds max achievable (${res.max_achievable_gmgds.toFixed(1)}). Showing best available operating point.</div>`;
   renderHelperPlots(df,res,tA,tB,bB,w1,w2);
   renderHelperOutput(res,tA,tB,bB,warnHtml);
 }
 
 function renderHelperPlots(df,res,tA,tB,bB,w1,w2){
-  const {optA,optB,bestRow,gmid_std,gmgds_std}=res;
+  const {optA,optB,optB_search,bestRow,gmid_std,gmgds_std}=res;
 
   // ── SCATTER: gm/gds vs gm/id (plasma by L) ──
   const lengthSet=[]; df.forEach(r=>{ if(!lengthSet.includes(r.length)) lengthSet.push(r.length); });
@@ -837,9 +875,10 @@ function renderHelperPlots(df,res,tA,tB,bB,w1,w2){
   lengthSet.forEach((L,li)=>{
     const pts=df.filter(r=>r.length===L);
     scatterTraces.push({ x:pts.map(r=>r.gm_id), y:pts.map(r=>r.gm_gds),
+      customdata:pts.map(r=>[FMT.gm_id(r.gm_id),FMT.gm_gds(r.gm_gds),FMT.id_w(r.id_w),FMT.ft(r.ft)]),
       type:'scatter',mode:'markers',name:`L=${L}`,
       marker:{color:plasmaColor(li/Math.max(nL-1,1)),size:4,opacity:0.35},
-      hovertemplate:`L=${L}<br>gm/ID: %{x:.2f}<br>gm/gds: %{y:.1f}<extra></extra>` });
+      hovertemplate:`<b>L=${L}</b><br>gm/ID: %{customdata[0]}<br>gm/gds: %{customdata[1]}<br>ID/W: %{customdata[2]}<br>fT: %{customdata[3]}<extra></extra>` });
   });
   // Target (amber triangle)
   scatterTraces.push({x:[tA],y:[tB],type:'scatter',mode:'markers',name:'Target',
@@ -870,28 +909,31 @@ function renderHelperPlots(df,res,tA,tB,bB,w1,w2){
   // ── LOSS SURFACE: loss vs gm/id sweep (gm/gds fixed at optB) ──
   const xSwp=[]; const step=(xMax-Math.max(0.5,tA-15))/200;
   for(let x=Math.max(0.5,tA-15);x<=tA+15;x+=step) xSwp.push(x);
-  const yLoss=xSwp.map(x=>w1*((x-tA)/gmid_std)**2+w2*((optB-tB)/gmgds_std)**2);
-  const minLoss=w1*((optA-tA)/gmid_std)**2+w2*((optB-tB)/gmgds_std)**2;
+  const yLoss=xSwp.map(x=>w1*((x-tA)/gmid_std)**2+w2*((optB_search-tB)/gmgds_std)**2);
+  const minLoss=w1*((optA-tA)/gmid_std)**2+w2*((optB_search-tB)/gmgds_std)**2;
   const lossTraces=[
-    {x:xSwp,y:yLoss,type:'scatter',mode:'lines',name:'Loss Surface',
+    {x:xSwp,y:yLoss,
+     customdata:xSwp.map(x=>[FMT.gm_id(x)]),
+     type:'scatter',mode:'lines',name:'Loss Surface',
      line:{color:'#e3b341',width:2},fill:'tozeroy',fillcolor:'rgba(227,179,65,0.07)',
-     hovertemplate:'gm/ID: %{x:.3f}<br>Loss: %{y:.2e}<extra></extra>'},
+     hovertemplate:'gm/ID: %{customdata[0]}<br>Loss: %{y:.3e}<extra></extra>'},
     {x:[tA],y:[w1*((0)/gmid_std)**2+w2*((optB-tB)/gmgds_std)**2],type:'scatter',mode:'lines',name:'Target',
      line:{color:'#f85149',dash:'dash',width:1.5},hoverinfo:'skip'},
     {x:[optA],y:[minLoss],type:'scatter',mode:'markers',name:'Optimum',
-     marker:{color:'#3fb950',size:10},hovertemplate:`Optimum<br>gm/ID: ${optA.toFixed(2)}<br>Loss: ${minLoss.toExponential(2)}<extra></extra>`}
+     marker:{color:'#3fb950',size:10},
+     hovertemplate:`Optimum<br>gm/ID: ${FMT.gm_id(optA)}<br>Loss: ${minLoss.toExponential(3)}<extra></extra>`}
   ];
   const lossLayout={...BASE,
     xaxis:{...BASE.xaxis,title:{text:'gm/ID (V⁻¹)',font:{size:12},standoff:8}},
     yaxis:{...BASE.yaxis,title:{text:'Loss ℒ',font:{size:12},standoff:8},type:'log'},
     margin:{l:60,r:10,t:30,b:50},
-    title:{text:`Loss Surface (gm/gds = ${optB.toFixed(1)})`,font:{size:12,color:'#8b949e'},x:0.5},
+    title:{text:`Loss Surface (gm/gds = ${optB_search.toFixed(1)}${optB_search<optB?' [clamped]':''})`,font:{size:12,color:'#8b949e'},x:0.5},
     showlegend:false,hovermode:'x unified'};
   Plotly.react('hPlotLoss',lossTraces,lossLayout,{responsive:true,displayModeBar:false});
 }
 
 function renderHelperOutput(res,tA,tB,bB,warnHtml){
-  const {top5,bestRow,logs,optA,optB}=res;
+  const {top5,bestRow,logs,optA,optB,optB_search}=res;
   if(!bestRow){ document.getElementById('helperOutput').innerHTML=warnHtml+'<div class="helper-empty"><div class="icon">⚠️</div><div>No valid operating point found. Relax constraints.</div></div>'; return; }
 
   // Distance range for colour coding
@@ -907,9 +949,9 @@ function renderHelperOutput(res,tA,tB,bB,warnHtml){
   </div>
   <div style="background:linear-gradient(90deg,rgba(63,185,80,.06),transparent);border:1px solid rgba(63,185,80,.25);border-left:3px solid #3fb950;border-radius:7px;padding:12px 16px;margin-bottom:12px;font-size:12px;color:var(--t2)">
     <div style="display:flex;gap:24px;flex-wrap:wrap">
-      <div>Target gm/ID: <strong style="color:var(--t1)">${tA.toFixed(2)}</strong> → Optimised: <strong style="color:#3fb950">${optA.toFixed(2)}</strong></div>
-      <div>Target gm/gds: <strong style="color:var(--t1)">${tB.toFixed(0)}</strong> → Optimised: <strong style="color:#3fb950">${optB.toFixed(1)}</strong></div>
-      <div>Bound (bB): <strong style="color:var(--t1)">${bB}</strong></div>
+      <div>Target gm/ID: <strong style="color:var(--t1)">${tA.toFixed(2)}</strong> → Searched: <strong style="color:#3fb950">${optA.toFixed(2)}</strong></div>
+      <div>Target gm/gds: <strong style="color:var(--t1)">${tB.toFixed(0)}</strong> → Searched: <strong style="color:#3fb950">${optB_search.toFixed(1)}</strong>${optB_search<optB?` <span style="color:var(--gold);font-size:10px">(clamped from ${optB.toFixed(0)})</span>`:''}</div>
+      <div>Bound (min gm/gds): <strong style="color:var(--t1)">${bB}</strong></div>
     </div>
   </div>
   <div class="metric-grid">
