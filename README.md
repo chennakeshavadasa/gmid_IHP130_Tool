@@ -50,13 +50,6 @@ Characterisation data from: [gmid_IHP130](https://github.com/chennakeshavadasa/g
 
 This is a **single-file self-contained web app** — no server, no build step, no dependencies to install.
 
-### GitHub Pages (recommended)
-
-1. Fork or clone this repo
-2. Go to **Settings → Pages**
-3. Source: **Deploy from a branch** → `main` → `/ (root)`
-4. Save — live at `https://your-username.github.io/your-repo-name` in ~60 seconds
-
 ### Local preview
 
 ```bash
