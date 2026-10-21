@@ -4,7 +4,7 @@
 
 An interactive web tool for gm/ID-based MOSFET design using IHP's SG13G2 130nm BiCMOS open-source PDK.
 
-**Live tool:** [https://chennakeshavadasa.github.io/gmid_IHP130_Tool/](https://chennakeshavadasa.github.io/gmid_IHP130_Tool/)
+**Live tool:** [https://nithinpuru.github.io/gmid/ihp-sg13g2/](https://nithinpuru.github.io/gmid/ihp-sg13g2/)
 
 ---
 
